@@ -6,7 +6,7 @@
 
     <groupId>org.jetlinks.community</groupId>
     <artifactId>jetlinks-community</artifactId>
-    <version>1.10.0-SNAPSHOT</version>
+    <version>1.12.0-SNAPSHOT</version>
     <modules>
         <module>jetlinks-components</module>
         <module>jetlinks-manager</module>
@@ -19,17 +19,18 @@
         <spring.boot.version>2.3.11.RELEASE</spring.boot.version>
         <java.version>1.8</java.version>
         <project.build.jdk>${java.version}</project.build.jdk>
-        <hsweb.framework.version>4.0.11-SNAPSHOT</hsweb.framework.version>
-        <easyorm.version>4.0.11-SNAPSHOT</easyorm.version>
+        <hsweb.framework.version>4.0.13-SNAPSHOT</hsweb.framework.version>
+        <easyorm.version>4.0.13-SNAPSHOT</easyorm.version>
         <hsweb.expands.version>3.0.2</hsweb.expands.version>
-        <jetlinks.version>1.1.7-SNAPSHOT</jetlinks.version>
+        <jetlinks.version>1.1.9-SNAPSHOT</jetlinks.version>
         <r2dbc.version>Arabba-SR10</r2dbc.version>
         <vertx.version>3.8.5</vertx.version>
         <netty.version>4.1.51.Final</netty.version>
         <elasticsearch.version>7.11.2</elasticsearch.version>
-        <reactor.excel.version>1.0.0</reactor.excel.version>
-        <reactor.ql.version>1.0.11</reactor.ql.version>
+        <reactor.excel.version>1.0.1</reactor.excel.version>
+        <reactor.ql.version>1.0.13</reactor.ql.version>
         <fastjson.version>1.2.70</fastjson.version>
+        <log4j.version>2.16.0</log4j.version>
     </properties>
 
     <build>
@@ -170,6 +171,24 @@
     <dependencyManagement>
 
         <dependencies>
+
+            <dependency>
+                <groupId>org.apache.logging.log4j</groupId>
+                <artifactId>log4j-to-slf4j</artifactId>
+                <version>${log4j.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>org.apache.logging.log4j</groupId>
+                <artifactId>log4j-api</artifactId>
+                <version>${log4j.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>org.apache.logging.log4j</groupId>
+                <artifactId>log4j-core</artifactId>
+                <version>${log4j.version}</version>
+            </dependency>
 
             <dependency>
                 <groupId>io.netty</groupId>
@@ -350,8 +369,7 @@
 
         <dependency>
             <groupId>org.codehaus.groovy</groupId>
-            <artifactId>groovy-all</artifactId>
-            <version>2.4.17</version>
+            <artifactId>groovy</artifactId>
         </dependency>
 
         <dependency>
@@ -363,7 +381,7 @@
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
-            <version>1.7.25</version>
+            <version>1.7.32</version>
         </dependency>
 
         <dependency>
@@ -395,13 +413,13 @@
         <repository>
             <id>aliyun-nexus</id>
             <name>aliyun</name>
-            <url>http://maven.aliyun.com/nexus/content/groups/public/</url>
+            <url>https://maven.aliyun.com/nexus/content/groups/public/</url>
         </repository>
 
         <repository>
             <id>hsweb-nexus</id>
             <name>Nexus Release Repository</name>
-            <url>http://nexus.hsweb.me/content/groups/public/</url>
+            <url>https://nexus.hsweb.me/content/groups/public/</url>
             <snapshots>
                 <enabled>true</enabled>
                 <updatePolicy>always</updatePolicy>
@@ -414,12 +432,12 @@
         <repository>
             <id>releases</id>
             <name>Nexus Release Repository</name>
-            <url>http://nexus.hsweb.me/content/repositories/releases/</url>
+            <url>https://nexus.hsweb.me/content/repositories/releases/</url>
         </repository>
         <snapshotRepository>
             <id>snapshots</id>
             <name>Nexus Snapshot Repository</name>
-            <url>http://nexus.hsweb.me/content/repositories/snapshots/</url>
+            <url>https://nexus.hsweb.me/content/repositories/snapshots/</url>
         </snapshotRepository>
     </distributionManagement>
 
@@ -427,7 +445,7 @@
         <pluginRepository>
             <id>aliyun-nexus</id>
             <name>aliyun</name>
-            <url>http://maven.aliyun.com/nexus/content/groups/public/</url>
+            <url>https://maven.aliyun.com/nexus/content/groups/public/</url>
         </pluginRepository>
     </pluginRepositories>
 </project>

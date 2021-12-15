@@ -30,6 +30,7 @@ import org.jetlinks.core.message.property.WritePropertyMessageReply;
 import org.jetlinks.core.metadata.ConfigMetadata;
 import org.jetlinks.core.metadata.PropertyMetadata;
 import org.jetlinks.core.metadata.types.StringType;
+import org.jetlinks.core.utils.CyclicDependencyChecker;
 import org.reactivestreams.Publisher;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
@@ -59,6 +60,7 @@ public class LocalDeviceInstanceService extends GenericReactiveCrudService<Devic
     public LocalDeviceInstanceService(DeviceRegistry registry,
                                       LocalDeviceProductService deviceProductService,
                                       DeviceConfigMetadataManager metadataManager,
+                                      @SuppressWarnings("all")
                                       ReactiveRepository<DeviceTagEntity, String> tagRepository) {
         this.registry = registry;
         this.deviceProductService = deviceProductService;
@@ -326,20 +328,20 @@ public class LocalDeviceInstanceService extends GenericReactiveCrudService<Devic
                 .collect(Collectors.groupingBy(Tuple2::getT1))
                 .flatMapIterable(Map::entrySet)
                 .flatMap(group -> {
-                    List<String> deviceId = group
+                    List<String> deviceIdList = group
                         .getValue()
                         .stream()
                         .map(Tuple3::getT2)
                         .collect(Collectors.toList());
                     DeviceState state = DeviceState.of(group.getKey());
-                    return Mono
-                        .zip(
+                    return Flux
+                        .concat(
                             //批量修改设备状态
-                            this.getRepository()
+                            getRepository()
                                 .createUpdate()
                                 .set(DeviceInstanceEntity::getState, state)
                                 .where()
-                                .in(DeviceInstanceEntity::getId, deviceId)
+                                .in(DeviceInstanceEntity::getId, deviceIdList)
                                 .execute()
                                 .thenReturn(group.getValue().size()),
                             //修改子设备状态
@@ -354,6 +356,8 @@ public class LocalDeviceInstanceService extends GenericReactiveCrudService<Devic
                                     .set(DeviceInstanceEntity::getState, state)
                                     .where()
                                     .in(DeviceInstanceEntity::getParentId, parents)
+                                    //不修改未激活的状态
+                                    .not(DeviceInstanceEntity::getState, DeviceState.notActive)
                                     .nest()
                                     /* */.accept(DeviceInstanceEntity::getFeatures, Terms.Enums.notInAny, DeviceFeature.selfManageState)
                                     /* */.or()
@@ -362,10 +366,12 @@ public class LocalDeviceInstanceService extends GenericReactiveCrudService<Devic
                                     .execute())
                                 .defaultIfEmpty(0)
                         )
-                        .thenReturn(deviceId
-                                        .stream()
-                                        .map(id -> DeviceStateInfo.of(id, state))
-                                        .collect(Collectors.toList()));
+                        .then(Mono.just(
+                            deviceIdList
+                                .stream()
+                                .map(id -> DeviceStateInfo.of(id, state))
+                                .collect(Collectors.toList())
+                        ));
                 }));
     }
 
@@ -457,5 +463,18 @@ public class LocalDeviceInstanceService extends GenericReactiveCrudService<Devic
             .flatMap(mapReply(FunctionInvokeMessageReply::getOutput));
     }
 
+    private final CyclicDependencyChecker<DeviceInstanceEntity, Void> checker = CyclicDependencyChecker
+        .of(DeviceInstanceEntity::getId, DeviceInstanceEntity::getParentId, this::findById);
+
+    public Mono<Void> checkCyclicDependency(DeviceInstanceEntity device) {
+        return checker.check(device);
+    }
+
+    public Mono<Void> checkCyclicDependency(String id, String parentId) {
+        DeviceInstanceEntity instance = new DeviceInstanceEntity();
+        instance.setId(id);
+        instance.setParentId(parentId);
+        return checker.check(instance);
+    }
 
 }
