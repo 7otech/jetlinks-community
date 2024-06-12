@@ -5,18 +5,45 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.commons.beanutils.BeanUtilsBean;
 import org.apache.commons.beanutils.Converter;
+import org.hswebframework.ezorm.rdb.mapping.ReactiveRepository;
+import org.hswebframework.web.api.crud.entity.EntityFactory;
+import org.hswebframework.web.cache.ReactiveCacheManager;
 import org.jetlinks.community.Interval;
+import org.jetlinks.community.JvmErrorException;
+import org.jetlinks.community.config.ConfigManager;
+import org.jetlinks.community.config.ConfigScopeCustomizer;
+import org.jetlinks.community.config.ConfigScopeProperties;
+import org.jetlinks.community.config.SimpleConfigManager;
+import org.jetlinks.community.config.entity.ConfigEntity;
+import org.jetlinks.community.reference.DataReferenceManager;
+import org.jetlinks.community.reference.DataReferenceProvider;
+import org.jetlinks.community.reference.DefaultDataReferenceManager;
+import org.jetlinks.community.resource.DefaultResourceManager;
+import org.jetlinks.community.resource.ResourceManager;
+import org.jetlinks.community.resource.ResourceProvider;
+import org.jetlinks.community.resource.TypeScriptDeclareResourceProvider;
+import org.jetlinks.community.resource.initialize.PermissionResourceProvider;
+import org.jetlinks.community.service.DefaultUserBindService;
 import org.jetlinks.community.utils.TimeUtils;
+import org.jetlinks.core.event.EventBus;
+import org.jetlinks.core.rpc.RpcManager;
 import org.jetlinks.reactor.ql.feature.Feature;
 import org.jetlinks.reactor.ql.supports.DefaultReactorQLMetadata;
 import org.jetlinks.reactor.ql.utils.CastUtils;
 import org.springframework.beans.BeansException;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.config.BeanPostProcessor;
+import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.jackson.Jackson2ObjectMapperBuilderCustomizer;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.core.ReactiveRedisOperations;
 import org.springframework.http.MediaType;
 import org.springframework.util.unit.DataSize;
+import reactor.core.Exceptions;
+import reactor.core.publisher.Hooks;
 
 import javax.annotation.Nonnull;
 import java.time.Duration;
@@ -25,6 +52,7 @@ import java.util.Date;
 
 @Configuration
 @SuppressWarnings("all")
+@EnableConfigurationProperties({ConfigScopeProperties.class})
 public class CommonConfiguration {
 
     static {
@@ -94,6 +122,20 @@ public class CommonConfiguration {
                 return (T)((Long) CastUtils.castNumber(value).longValue());
             }
         }, Long.class);
+
+        //捕获jvm错误,防止Flux被挂起
+        Hooks.onOperatorError((err, val) -> {
+            if (Exceptions.isJvmFatal(err)) {
+                return new JvmErrorException(err);
+            }
+            return err;
+        });
+        Hooks.onNextError((err, val) -> {
+            if (Exceptions.isJvmFatal(err)) {
+                return new JvmErrorException(err);
+            }
+            return err;
+        });
     }
 
     @Bean
@@ -116,4 +158,50 @@ public class CommonConfiguration {
         };
     }
 
+    @Bean
+    public ConfigManager configManager(ObjectProvider<ConfigScopeCustomizer> configScopeCustomizers,
+                                       ReactiveRepository<ConfigEntity, String> repository,
+                                       ReactiveCacheManager cacheManager) {
+
+        SimpleConfigManager configManager = new SimpleConfigManager(repository,cacheManager);
+        for (ConfigScopeCustomizer customizer : configScopeCustomizers) {
+            customizer.custom(configManager);
+        }
+        return configManager;
+    }
+
+    @Bean
+    public PermissionResourceProvider permissionResourceProvider(){
+        return new PermissionResourceProvider();
+    }
+
+    @Bean
+    public TypeScriptDeclareResourceProvider typeScriptDeclareResourceProvider() {
+        return new TypeScriptDeclareResourceProvider();
+    }
+
+    @Bean
+    public ResourceManager resourceManager(ObjectProvider<ResourceProvider> providers) {
+        DefaultResourceManager manager = new DefaultResourceManager();
+        providers.forEach(manager::addProvider);
+        return manager;
+    }
+
+    @Bean
+    public DataReferenceManager dataReferenceManager(ObjectProvider<DataReferenceProvider> provider) {
+        DefaultDataReferenceManager referenceManager = new DefaultDataReferenceManager();
+
+        provider.forEach(referenceManager::addStrategy);
+
+        return referenceManager;
+    }
+
+    @AutoConfiguration
+    @ConditionalOnClass(ReactiveRedisOperations.class)
+    static class DefaultUserBindServiceConfiguration {
+        @Bean
+        public DefaultUserBindService defaultUserBindService(ReactiveRedisOperations<Object, Object> redis) {
+            return new DefaultUserBindService(redis);
+        }
+    }
 }
