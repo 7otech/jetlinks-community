@@ -1,14 +1,21 @@
 package org.jetlinks.community.device.service;
 
 import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.MapUtils;
 import org.hswebframework.ezorm.rdb.mapping.ReactiveRepository;
+import org.jetlinks.community.PropertyConstants;
+import org.jetlinks.community.buffer.PersistenceBuffer;
+import org.jetlinks.community.configure.cluster.Cluster;
 import org.jetlinks.community.device.entity.DeviceInstanceEntity;
 import org.jetlinks.community.device.entity.DeviceTagEntity;
 import org.jetlinks.community.device.enums.DeviceFeature;
 import org.jetlinks.community.device.enums.DeviceState;
 import org.jetlinks.community.gateway.annotation.Subscribe;
+import org.jetlinks.community.utils.ErrorUtils;
 import org.jetlinks.core.device.DeviceConfigKey;
 import org.jetlinks.core.device.DeviceOperator;
 import org.jetlinks.core.device.DeviceRegistry;
@@ -17,22 +24,33 @@ import org.jetlinks.core.event.Subscription;
 import org.jetlinks.core.message.*;
 import org.jetlinks.core.metadata.DeviceMetadata;
 import org.jetlinks.core.utils.FluxUtils;
+import org.jetlinks.core.utils.Reactors;
 import org.jetlinks.reactor.ql.utils.CastUtils;
 import org.jetlinks.supports.official.JetLinksDeviceMetadataCodec;
+import org.springframework.dao.QueryTimeoutException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
+import reactor.core.Disposable;
+import reactor.core.Disposables;
 import reactor.core.publisher.BufferOverflowStrategy;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
+import java.io.Externalizable;
+import java.io.IOException;
+import java.io.ObjectInput;
+import java.io.ObjectOutput;
 import java.time.Duration;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 
 @Component
 @AllArgsConstructor
@@ -49,6 +67,16 @@ public class DeviceMessageBusinessHandler {
 
     private final EventBus eventBus;
 
+    private final Disposable.Composite disposable = Disposables.composite();
+
+    /**
+     * 自动注册设备信息
+     * <p>
+     * 设备消息的header需要包含{@code deviceName},{@code productId}才会自动注册.、
+     *
+     * @param message 注册消息
+     * @return 注册后的设备操作接口
+     */
     private Mono<DeviceOperator> doAutoRegister(DeviceRegisterMessage message) {
         //自动注册
         return Mono
@@ -75,46 +103,57 @@ public class DeviceMessageBusinessHandler {
                 instance.setCreateTimeNow();
                 instance.setCreatorId(tps.getT4().getCreatorId());
                 instance.setOrgId(tps.getT4().getOrgId());
+
+                //设备自状态管理
+                //网关注册设备子设备时,设置自状态管理。
+                //在检查子设备状态时,将会发送ChildDeviceMessage<DeviceStateCheckMessage>到网关
+                //网关需要回复ChildDeviceMessageReply<DeviceStateCheckMessageReply>
                 @SuppressWarnings("all")
                 boolean selfManageState = CastUtils
                     .castBoolean(tps.getT5().getOrDefault(DeviceConfigKey.selfManageState.getKey(), false));
 
-                if (selfManageState) {
-                    instance.addFeature(DeviceFeature.selfManageState);
-                }
-
                 instance.setState(selfManageState ? DeviceState.offline : DeviceState.online);
+                //合并配置
+                instance.mergeConfiguration(tps.getT5());
 
                 return deviceService
-                    .save(Mono.just(instance))
-                    .thenReturn(instance)
-                    .flatMap(device -> registry
-                        .register(device.toDeviceInfo()
-                                        .addConfig("state", selfManageState
-                                            ? org.jetlinks.core.device.DeviceState.offline
-                                            : org.jetlinks.core.device.DeviceState.online)));
+                    .save(instance)
+                    .then(Mono.defer(() -> registry
+                        .register(instance.toDeviceInfo()
+                                          .addConfig("state", selfManageState
+                                              ? org.jetlinks.core.device.DeviceState.offline
+                                              : org.jetlinks.core.device.DeviceState.online))));
             });
     }
+
 
     @Subscribe("/device/*/*/register")
     @Transactional(propagation = Propagation.NEVER)
     public Mono<Void> autoRegisterDevice(DeviceRegisterMessage message) {
+        if (message.getHeader(Headers.force).orElse(false)) {
+            return this
+                .doAutoRegister(message)
+                .then();
+        }
         return registry
             .getDevice(message.getDeviceId())
             .flatMap(device -> {
+                //注册消息中修改了配置信息
                 @SuppressWarnings("all")
                 Map<String, Object> config = message.getHeader("configuration").map(Map.class::cast).orElse(null);
                 if (MapUtils.isNotEmpty(config)) {
-                    return device
-                        .setConfigs(config)
+
+                    return deviceService
+                        .mergeConfiguration(device.getDeviceId(), config, update ->
+                            //更新设备名称
+                            update.set(DeviceInstanceEntity::getName,
+                                       message.getHeader(PropertyConstants.deviceName).orElse(null)))
                         .thenReturn(device);
                 }
                 return Mono.just(device);
             })
-            .switchIfEmpty(Mono.defer(() -> {
-                //自动注册
-                return doAutoRegister(message);
-            }))
+            //注册中心中没有此设备则进行自动注册
+            .switchIfEmpty(Mono.defer(() -> doAutoRegister(message)))
             .then();
     }
 
@@ -125,8 +164,9 @@ public class DeviceMessageBusinessHandler {
      * @return void
      */
     @Subscribe("/device/*/*/message/children/*/register")
-    @Transactional(propagation = Propagation.NEVER)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public Mono<Void> autoBindChildrenDevice(ChildDeviceMessage message) {
+
         Message childMessage = message.getChildDeviceMessage();
         if (childMessage instanceof DeviceRegisterMessage) {
             String childId = ((DeviceRegisterMessage) childMessage).getDeviceId();
@@ -134,20 +174,27 @@ public class DeviceMessageBusinessHandler {
                 log.warn("子设备注册消息循环依赖:{}", message);
                 return Mono.empty();
             }
+            //网关设备添加到header中
+            childMessage.addHeaderIfAbsent(DeviceConfigKey.parentGatewayId.getKey(), message.getDeviceId());
+
             return registry
                 .getDevice(childId)
-                .switchIfEmpty(Mono.defer(() -> doAutoRegister(((DeviceRegisterMessage) childMessage))))
-                .flatMap(dev -> dev
-                    .setConfig(DeviceConfigKey.parentGatewayId, message.getDeviceId())
-                    .thenReturn(dev))
-                .flatMap(DeviceOperator::getState)
-                .flatMap(state -> deviceService
-                    .createUpdate()
-                    .set(DeviceInstanceEntity::getParentId, message.getDeviceId())
-                    .set(DeviceInstanceEntity::getState, DeviceState.of(state))
-                    .where(DeviceInstanceEntity::getId, childId)
-                    .execute()
-                ).then();
+                .map(device -> device
+                    .getState()
+                    //更新数据库
+                    .flatMap(state -> deviceService
+                        .createUpdate()
+                        .set(DeviceInstanceEntity::getParentId, message.getDeviceId())
+                        //状态还有更好的更新方式?
+                        .set(DeviceInstanceEntity::getState, DeviceState.of(state))
+                        .where(DeviceInstanceEntity::getId, childId)
+                        .execute())
+                    //更新缓存
+                    .then(device.setConfig(DeviceConfigKey.parentGatewayId, message.getDeviceId()))
+                    .thenReturn(device))
+                .defaultIfEmpty(Mono.defer(() -> doAutoRegister(((DeviceRegisterMessage) childMessage))))
+                .flatMap(Function.identity())
+                .then();
         }
         return Mono.empty();
     }
@@ -163,18 +210,15 @@ public class DeviceMessageBusinessHandler {
         Message childMessage = message.getChildDeviceMessage();
         if (childMessage instanceof DeviceUnRegisterMessage) {
             String childId = ((DeviceUnRegisterMessage) childMessage).getDeviceId();
-            return registry
-                .getDevice(childId)
-                .flatMap(dev -> dev
-                    .removeConfig(DeviceConfigKey.parentGatewayId.getKey())
-                    .then(dev.checkState()))
-                .flatMap(state -> deviceService
-                    .createUpdate()
-                    .setNull(DeviceInstanceEntity::getParentId)
-                    .set(DeviceInstanceEntity::getState, DeviceState.of(state))
-                    .where(DeviceInstanceEntity::getId, childId)
-                    .execute()
-                    .then());
+            if(!StringUtils.hasText(childId)){
+                return Mono.empty();
+            }
+            return deviceService
+                .createUpdate()
+                .setNull(DeviceInstanceEntity::getParentId)
+                .where(DeviceInstanceEntity::getId, childId)
+                .execute()
+                .then();
         }
         return Mono.empty();
     }
@@ -182,6 +226,9 @@ public class DeviceMessageBusinessHandler {
     @Subscribe("/device/*/*/unregister")
     @Transactional(propagation = Propagation.NEVER)
     public Mono<Void> unRegisterDevice(DeviceUnRegisterMessage message) {
+        if(message.getHeader(Headers.ignore).orElse(false)){
+            return Mono.empty();
+        }
         //注销设备
         return deviceService
             .unregisterDevice(message.getDeviceId())
@@ -256,6 +303,40 @@ public class DeviceMessageBusinessHandler {
     }
 
 
+
+    @AllArgsConstructor
+    @NoArgsConstructor
+    @Getter
+    @Setter
+    public static class StateBuf implements Externalizable {
+        //有效期一小时
+        static long expires = Duration.ofHours(1).toMillis();
+
+        private String id;
+        private long time;
+
+        @Override
+        public void writeExternal(ObjectOutput out) throws IOException {
+            out.writeUTF(id);
+            out.writeLong(time);
+        }
+
+        @Override
+        public void readExternal(ObjectInput in) throws IOException {
+            id = in.readUTF();
+            time = in.readLong();
+        }
+
+        public boolean isEffective() {
+            return System.currentTimeMillis() - time < expires;
+        }
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        disposable.dispose();
+    }
+
     @PostConstruct
     public void init() {
 
@@ -266,22 +347,36 @@ public class DeviceMessageBusinessHandler {
             .justLocal()//只订阅本地
             .build();
 
-        //订阅设备上下线消息,同步数据库中的设备状态,
-        //最小间隔800毫秒,最大缓冲数量500,最长间隔2秒.
-        //如果2条消息间隔大于0.8秒则不缓冲直接更新
-        //否则缓冲,数量超过500后批量更新
-        //无论缓冲区是否超过500条,都每2秒更新一次.
-        FluxUtils.bufferRate(eventBus
-                                 .subscribe(subscription, DeviceMessage.class)
-                                 .map(DeviceMessage::getDeviceId),
-                             800, Integer.getInteger("device.state.sync.batch", 500), Duration.ofSeconds(2))
-                 .onBackpressureBuffer(64,
-                                       list -> log.warn("无法处理更多设备状态同步!"),
-                                       BufferOverflowStrategy.DROP_OLDEST)
-                 .publishOn(Schedulers.boundedElastic(), 64)
-                 .concatMap(list -> deviceService.syncStateBatch(Flux.just(list), false).map(List::size))
-                 .onErrorContinue((err, obj) -> log.error(err.getMessage(), err))
-                 .subscribe((i) -> log.info("同步设备状态成功:{}", i));
+        //缓冲同步设备上线信息,在突发大量上下线的情况,减少数据库的压力
+        PersistenceBuffer<StateBuf> buffer =
+            new PersistenceBuffer<>(
+                "./data/device-state-buffer",
+                "device-state.queue",
+                StateBuf::new,
+                flux -> deviceService
+                    .syncStateBatch(flux
+                                        .filter(StateBuf::isEffective)
+                                        .map(StateBuf::getId)
+                                        .distinct()
+                                        .collectList()
+                                        .flux(), false)
+                    .then(Reactors.ALWAYS_FALSE))
+                .name("device-state-synchronizer")
+                .parallelism(1)
+                .bufferTimeout(Duration.ofSeconds(1))
+                .retryWhenError(e -> ErrorUtils
+                    .hasException(e,
+                                  IOException.class,
+                                  QueryTimeoutException.class))
+                .bufferSize(1000);
+
+        buffer.start();
+
+        disposable.add(eventBus
+                           .subscribe(subscription, DeviceMessage.class)
+                           .subscribe(msg -> buffer.write(new StateBuf(msg.getDeviceId(), msg.getTimestamp()))));
+
+        disposable.add(buffer);
 
     }
 
